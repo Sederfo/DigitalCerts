@@ -8,6 +8,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption
 from datetime import datetime, timedelta
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 import traceback
 
 # Database setup
@@ -136,6 +137,11 @@ def issue_certificate(subject_name, root_cert_path, root_key_path, output_folder
                       organization="UVT"):
     logging.info(f"Issuing certificate for {subject_name}.")
 
+    # Validate the root certificate
+    if not validate_certificate(root_cert_path, root_cert_path, root_cert_id):
+        logging.error("Root certificate validation failed. Cannot issue a new certificate.")
+        raise ValueError("Root certificate validation failed.")
+
     with open(root_cert_path, "rb") as f:
         root_cert = x509.load_pem_x509_certificate(f.read())
 
@@ -181,6 +187,70 @@ def issue_certificate(subject_name, root_cert_path, root_key_path, output_folder
     logging.info(f"Private key for {subject_name} saved at {key_path}")
 
     return cert_path, key_path
+
+# Certificate Validation
+def validate_certificate(cert_path, root_cert_path, cert_id):
+    """
+    Validates a certificate against the root certificate and checks revocation status
+    in both the database and the CRL file.
+    
+    Parameters:
+        cert_path (str): Path to the certificate to validate.
+        root_cert_path (str): Path to the root certificate.
+    
+    Returns:
+        bool: True if the certificate is valid, False otherwise.
+    """
+    try:
+        # Load the certificate to validate
+        with open(cert_path, "rb") as f:
+            cert = x509.load_pem_x509_certificate(f.read())
+
+        # Load the root certificate
+        with open(root_cert_path, "rb") as f:
+            root_cert = x509.load_pem_x509_certificate(f.read())
+
+        # Verify signature
+        public_key = root_cert.public_key()
+        public_key.verify(
+            cert.signature,
+            cert.tbs_certificate_bytes,
+            padding.PKCS1v15(),  # Required padding
+            cert.signature_hash_algorithm,
+        )
+
+        # Check validity period
+        now = datetime.utcnow()
+        if not (cert.not_valid_before <= now <= cert.not_valid_after):
+            logging.warning(f"Certificate {cert.subject} is expired or not yet valid.")
+            return False
+
+        # Check revocation in the CRL file
+        crl_revoked = False
+        try:
+            with open("crl.pem", "rb") as f:
+                crl = x509.load_pem_x509_crl(f.read())
+            for revoked_cert in crl:
+                if revoked_cert.serial_number == cert.serial_number:
+                    crl_revoked = True
+                    break
+        except FileNotFoundError:
+            logging.warning("CRL file 'crl.pem' not found. Skipping CRL check.")
+        except Exception as e:
+            logging.error(f"Failed to parse CRL: {e}")
+            logging.debug(traceback.format_exc())
+
+        if crl_revoked:
+            logging.warning(f"Certificate {cert.subject} is revoked in the CRL.")
+            return False
+
+        logging.info(f"Certificate {cert.subject} is valid.")
+        return True
+
+    except Exception as e:
+        logging.error(f"Certificate validation failed: {e}")
+        logging.debug(traceback.format_exc())
+        return False
 
 def generate_crl(root_cert_path, root_key_path):
     conn = sqlite3.connect("certificates.db")
